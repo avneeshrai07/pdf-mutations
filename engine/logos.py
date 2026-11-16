@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
-import fitz
+import pymupdf as fitz
 
 from .config import Config, normalize
 from . import ocr
@@ -56,7 +56,7 @@ class LogoMatcher:
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self._seen: Dict[str, bool] = {}  # md5(image bytes) -> verdict, shared across PDFs
+        self._info: Dict[str, tuple] = {}  # md5(image bytes) -> (reference match, OCR text), shared across PDFs
         self._refs: List[int] = []
         if cfg.logo_reference_dir:
             for f in sorted(Path(cfg.logo_reference_dir).iterdir()):
@@ -65,33 +65,34 @@ class LogoMatcher:
                     if arr is not None:
                         self._refs.append(_dhash(arr))
 
-    def is_logo(self, data: bytes) -> bool:
-        key = hashlib.md5(data).hexdigest()
-        if key in self._seen:
-            return self._seen[key]
-        verdict = self._check(data)
-        self._seen[key] = verdict
-        return verdict
+    def is_logo(self, data: bytes, keys: Sequence[str] = ()) -> bool:
+        """`keys`: normalised company names for this document (OCR text is matched against them)."""
+        md5 = hashlib.md5(data).hexdigest()
+        if md5 not in self._info:
+            self._info[md5] = self._analyse(data)
+        ref_hit, text = self._info[md5]
+        if ref_hit:
+            return True
+        return bool(text and keys and any(k in text for k in keys))
 
-    def _check(self, data: bytes) -> bool:
+    def _analyse(self, data: bytes):
+        """-> (matches a reference logo, normalised OCR text). Cached per image, independent of names."""
         arr = _decode(data)
         if arr is None:
-            return False
+            return False, ""
         h, w = arr.shape[:2]
         if min(h, w) < self.cfg.min_logo_pixels:
-            return False
+            return False, ""
         if self._refs:
             hv = _dhash(arr)
             if any(bin(hv ^ r).count("1") <= self.cfg.reference_max_distance for r in self._refs):
-                return True
+                return True, ""
+        text = ""
         if self.cfg.ocr_images:
             # tiny logos OCR badly: upscale so small text stays readable
-            scale = 2.0 if max(h, w) < 400 else 1.0
-            if scale != 1.0:
+            if max(h, w) < 400:
                 import cv2
 
-                arr = cv2.resize(arr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                arr = cv2.resize(arr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
             text = normalize(" ".join(t for t, _ in ocr.read_lines(arr)))
-            if text and any(k in text for k in self.cfg.company_keys):
-                return True
-        return False
+        return False, text

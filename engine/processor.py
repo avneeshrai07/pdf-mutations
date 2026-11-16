@@ -7,11 +7,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import fitz
+import pymupdf as fitz
 
 from . import ocr
 from .config import Config, normalize
 from .logos import LogoMatcher
+from . import logo_fingerprint as fp
+from .name_detect import NameSet, detect_in_doc, detect_in_page, expand
+from .textmatch import NameHit, find_name_hits
+from .vector_logo import find_logo
 
 _matcher: Optional[LogoMatcher] = None
 _matcher_cfg_id: Optional[int] = None
@@ -33,6 +37,10 @@ class Result:
     text_hits: int = 0
     image_hits: int = 0
     ocr_hits: int = 0
+    vector_hits: int = 0   # vector logos removed
+    residual: int = 0      # company names / logos still present after editing (should be 0)
+    detected: list = field(default_factory=list)  # company names found automatically
+    notes: str = ""
     error: str = ""
 
 
@@ -44,6 +52,35 @@ class _Op:
     fontsize: float = 0.0
     color: Tuple[float, float, float] = (0, 0, 0)
     origin: Optional[fitz.Point] = None  # baseline start for text-layer hits
+
+
+_templates: Optional[list] = None
+_templates_key: Optional[tuple] = None
+
+
+def _get_templates(cfg: Config) -> list:
+    """Learned vector-logo templates (loaded once per process)."""
+    global _templates, _templates_key
+    key = (str(cfg.vector_templates_dir), cfg.vector_logo_enabled)
+    if _templates is None or _templates_key != key:
+        _templates, _templates_key = [], key
+        d = cfg.vector_templates_dir
+        if cfg.vector_logo_enabled and d and Path(d).is_dir():
+            _templates = [fp.Template.load(f) for f in sorted(Path(d).glob("logo_template_*.json"))]
+    return _templates
+
+
+def _names_for(doc: fitz.Document, cfg: Config) -> NameSet:
+    """Names to remove from this document: the configured ones plus the ones found automatically."""
+    proj = normalize(cfg.project_name)
+    detected: list = []
+    if cfg.auto_detect_names:
+        for n in detect_in_doc(doc):
+            k = normalize(n)
+            if proj in k or k in proj or k in cfg.keep_keys:  # not the project name, not a protected name
+                continue
+            detected.append(n)
+    return expand(list(cfg.companies) + detected, keep=set(cfg.keep_keys), exclude={proj}, detected=detected)
 
 
 # ---------------------------------------------------------------- helpers
@@ -119,7 +156,7 @@ def _write(page: fitz.Page, op: _Op, bold: bool = False) -> None:
         avail = max(op.rect.width, 1)
         width = fitz.get_text_length(op.new_text, fontname=font, fontsize=size)
         if width > avail:
-            size = max(size * avail / width, 4)
+            size = max(size * avail / width, 1.5)  # always fit the original width, never overlap neighbours
         page.insert_text(op.origin, op.new_text, fontname=font, fontsize=size, color=color)
         return
     size = op.fontsize or min(op.rect.height * 0.6, 24)
@@ -133,24 +170,14 @@ def _write(page: fitz.Page, op: _Op, bold: bool = False) -> None:
 
 
 # ---------------------------------------------------------------- per page
-def _text_pass(page: fitz.Page, cfg: Config) -> int:
-    hits: List[fitz.Rect] = []
-    for key_src in cfg.companies:
-        hits += page.search_for(key_src)
-    rects = _dedupe(hits)
-    if not rects:
+def _text_pass(page: fitz.Page, cfg: Config, hits: List[NameHit]) -> int:
+    if not hits:
         return 0
     ops: List[_Op] = []
-    for r in rects:
-        fill = _background(page, r, cfg)
-        style = _text_style(page, r)
-        op = _Op(rect=r, fill=fill, new_text=cfg.project_name)
-        bold = False
-        if style:
-            op.fontsize, op.color, op.origin, bold = style
-        else:
-            op.fontsize, op.origin = r.height / 1.25, fitz.Point(r.x0, r.y1 - r.height * 0.22)
-        op.bold = bold  # type: ignore[attr-defined]
+    for h in hits:
+        op = _Op(rect=h.rect, fill=_background(page, h.rect, cfg), new_text=cfg.project_name,
+                 fontsize=h.size, color=h.color, origin=h.origin)
+        op.bold = h.bold  # type: ignore[attr-defined]
         ops.append(op)
     _apply(page, ops, images=fitz.PDF_REDACT_IMAGE_NONE, text=fitz.PDF_REDACT_TEXT_REMOVE)
     for op in ops:
@@ -158,8 +185,51 @@ def _text_pass(page: fitz.Page, cfg: Config) -> int:
     return len(ops)
 
 
+def _vector_detect(page: fitz.Page, cfg: Config, hits: List[NameHit], drawings: list) -> List[fitz.Rect]:
+    """Where are the vector logos? Learned templates first, name-anchored search as fallback."""
+    rects: List[fitz.Rect] = []
+    for tpl in _get_templates(cfg):
+        rects += [m.rect for m in fp.find(page, tpl, cfg.vector_min_score, drawings)]
+    if not rects and cfg.vector_fallback_name_anchor and hits:
+        for h in sorted(hits, key=lambda h: h.rect.height, reverse=True):
+            m = find_logo(page, h.rect, drawings)
+            if m:
+                rects.append(m.logo)
+                break
+    return _dedupe(rects)
+
+
+def _vector_remove(page: fitz.Page, cfg: Config, rects: List[fitz.Rect]) -> None:
+    for r in rects:
+        page.add_redact_annot(r + (-0.5, -0.5, 0.5, 0.5), fill=False)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, text=fitz.PDF_REDACT_TEXT_NONE,
+                          graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED)
+    if cfg.vector_logo_text:
+        for r in rects:
+            _write(page, _Op(rect=r, fill=_background(page, r, cfg), new_text=cfg.project_name))
+
+
+def _residual(page: fitz.Page, cfg: Config, names: NameSet) -> int:
+    """Company names / logos still on the page after editing."""
+    proj = normalize(cfg.project_name)
+    keys = tuple(k for k in names.keys if k not in proj)  # project name may contain a company word
+    n = len(find_name_hits(page, keys, names.acronyms)) if keys else 0
+    if cfg.auto_detect_names:  # any other company-looking name still there?
+        for nm in detect_in_page(page):
+            k = normalize(nm)
+            if proj not in k and k not in proj and k not in cfg.keep_keys:
+                n += 1
+    if cfg.vector_logo_enabled:
+        tpls = _get_templates(cfg)
+        if tpls:
+            d = page.get_drawings()
+            for tpl in tpls:
+                n += len(fp.find(page, tpl, cfg.vector_min_score, d))
+    return n
+
+
 def _image_pass(doc: fitz.Document, page: fitz.Page, cfg: Config, matcher: LogoMatcher,
-                verdicts: dict) -> int:
+                verdicts: dict, names: NameSet) -> int:
     page_area = page.rect.get_area()
     ops: List[_Op] = []
     for img in page.get_images(full=True):
@@ -170,7 +240,7 @@ def _image_pass(doc: fitz.Document, page: fitz.Page, cfg: Config, matcher: LogoM
             except Exception:
                 info = None
             ok = bool(info) and info["ext"].lower() in cfg.logo_image_extensions
-            verdicts[xref] = bool(ok and matcher.is_logo(info["image"]))
+            verdicts[xref] = bool(ok and matcher.is_logo(info["image"], names.keys))
         if not verdicts[xref]:
             continue
         for r in page.get_image_rects(xref):
@@ -186,15 +256,15 @@ def _image_pass(doc: fitz.Document, page: fitz.Page, cfg: Config, matcher: LogoM
     return len(ops)
 
 
-def _scanned_pass(page: fitz.Page, cfg: Config) -> int:
+def _scanned_pass(page: fitz.Page, cfg: Config, names: NameSet) -> int:
     zoom = 2.0
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB, alpha=False)
     ops: List[_Op] = []
     for txt, (x0, y0, x1, y1) in ocr.read_lines(pix.tobytes("png")):
-        if not any(k in normalize(txt) for k in cfg.company_keys):
+        if not any(k in normalize(txt) for k in names.keys):
             continue
         new = txt
-        for name in cfg.companies:
+        for name in names.variants:
             new = re.sub(re.escape(name), cfg.project_name, new, flags=re.IGNORECASE)
         if new == txt:  # matched only after normalisation -> replace the whole line
             new = cfg.project_name
@@ -209,14 +279,14 @@ def _scanned_pass(page: fitz.Page, cfg: Config) -> int:
     return len(ops)
 
 
-def _scrub_metadata(doc: fitz.Document, cfg: Config) -> bool:
+def _scrub_metadata(doc: fitz.Document, cfg: Config, names: NameSet) -> bool:
     meta = dict(doc.metadata or {})
     changed = False
     for k, v in meta.items():
         if not v or k in ("format", "encryption"):
             continue
         new = v
-        for name in cfg.companies:
+        for name in names.variants:
             new = re.sub(re.escape(name), cfg.project_name, new, flags=re.IGNORECASE)
         if new != v:
             meta[k], changed = new, True
@@ -238,23 +308,46 @@ def process_pdf(src: Path, dst: Path, cfg: Config, dry_run: bool = False) -> Res
             if doc.needs_pass:
                 raise RuntimeError("PDF is password protected")
             verdicts: dict = {}
+            names = _names_for(doc, cfg)
+            res.detected = list(names.detected)
+            vector_on = cfg.vector_logo_enabled and (_get_templates(cfg) or cfg.vector_fallback_name_anchor)
+            no_logo_pages = []
             for page in doc:
+                # 1) detect first (the name is the anchor for the fallback logo search) ...
+                hits = find_name_hits(page, names.keys, names.acronyms) if (cfg.replace_text or vector_on) else []
+                vrects: List[fitz.Rect] = []
+                if vector_on:
+                    vrects = _vector_detect(page, cfg, hits, page.get_drawings())
+                # 2) ... then edit
                 if cfg.replace_text:
-                    res.text_hits += _text_pass(page, cfg)
+                    res.text_hits += _text_pass(page, cfg, hits)
+                if vrects:
+                    _vector_remove(page, cfg, vrects)
+                    res.vector_hits += len(vrects)
+                page_images = 0
                 if matcher is not None:
-                    res.image_hits += _image_pass(doc, page, cfg, matcher, verdicts)
+                    page_images = _image_pass(doc, page, cfg, matcher, verdicts, names)
+                    res.image_hits += page_images
+                if vector_on and hits and not vrects and not page_images:
+                    no_logo_pages.append(page.number + 1)  # name present, but no logo of any kind removed
                 if cfg.ocr_scanned_pages and not page.get_text().strip():
-                    res.ocr_hits += _scanned_pass(page, cfg)
-            meta_changed = _scrub_metadata(doc, cfg) if cfg.scrub_metadata else False
-            changed = bool(res.text_hits or res.image_hits or res.ocr_hits or meta_changed)
+                    res.ocr_hits += _scanned_pass(page, cfg, names)
+                res.residual += _residual(page, cfg, names)
+            if no_logo_pages:
+                res.notes = f"company name found but no logo on page(s) {no_logo_pages[:10]}"
+            meta_changed = _scrub_metadata(doc, cfg, names) if cfg.scrub_metadata else False
+            changed = bool(res.text_hits or res.image_hits or res.ocr_hits or res.vector_hits or meta_changed)
+            flagged = res.residual > 0 or bool(res.notes)
             if dry_run:
-                res.status = "ok" if changed else "unchanged"
+                res.status = "review" if flagged else ("ok" if changed else "unchanged")
                 return res
             dst.parent.mkdir(parents=True, exist_ok=True)
             if changed:
                 tmp = dst.with_suffix(".tmp")
                 doc.save(tmp, garbage=3, deflate=True)
                 tmp.replace(dst)
+                if flagged:
+                    res.status = "review"  # saved, but a human should look at it
             else:
                 res.status = "unchanged"
                 if cfg.copy_unchanged:

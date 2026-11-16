@@ -2,3 +2,8 @@ pymupdf
 rapidocr
 onnxruntime
 pyyaml
+
+# optional: CLIP image classification in phase1/extract.py (logo / signature / photo ...)
+torch
+open_clip_torch
+pillow

@@ -36,11 +36,22 @@ class Config:
     workers: int = 1
     skip_existing: bool = True
     copy_unchanged: bool = True
+    # vector (drawn) logos, e.g. CAD title blocks
+    vector_logo_enabled: bool = True
+    vector_templates_dir: Optional[Path] = None
+    vector_min_score: float = 0.9
+    vector_fallback_name_anchor: bool = False
+    vector_logo_text: bool = False  # also write the project name in the removed logo's box
+    # automatic company-name detection (legal suffix: LTD, LIMITED, INC, ...)
+    auto_detect_names: bool = True
+    keep_names: Tuple[str, ...] = ()  # names that must never be replaced
 
     # normalised company names, longest first (so "Acme Corp" wins over "Acme")
     company_keys: Tuple[str, ...] = field(init=False, default=())
+    keep_keys: Tuple[str, ...] = field(init=False, default=())
 
     def __post_init__(self) -> None:
+        self.keep_keys = tuple(normalize(k) for k in self.keep_names if normalize(k))
         self.company_keys = tuple(
             sorted({normalize(c) for c in self.companies if normalize(c)}, key=len, reverse=True)
         )
@@ -66,8 +77,10 @@ def load_config(path: Union[str, Path]) -> Config:
     if not project_name:
         raise SystemExit("config: project_name is required")
     companies = tuple(str(c).strip() for c in (raw.get("companies") or []) if str(c).strip())
-    if not companies:
-        raise SystemExit("config: companies must list at least one name")
+    auto = raw.get("auto_detect_names") or {}
+    auto_on = bool(auto.get("enabled", True))
+    if not companies and not auto_on:
+        raise SystemExit("config: list at least one name in companies, or enable auto_detect_names")
 
     exts = tuple(
         str(e).lower().lstrip(".")
@@ -90,6 +103,8 @@ def load_config(path: Union[str, Path]) -> Config:
     if removal not in ("remove", "pixels"):
         raise SystemExit("config: options.image_removal must be 'remove' or 'pixels'")
 
+    vec = raw.get("vector_logo") or {}
+    vt = vec.get("templates_dir")
     ref = raw.get("logo_reference_dir")
     cfg = Config(
         input_dir=resolve(paths["input_dir"]),
@@ -112,10 +127,20 @@ def load_config(path: Union[str, Path]) -> Config:
         workers=max(1, int(opts.get("workers", 1))),
         skip_existing=bool(opts.get("skip_existing", True)),
         copy_unchanged=bool(opts.get("copy_unchanged", True)),
+        vector_logo_enabled=bool(vec.get("enabled", True)),
+        vector_templates_dir=resolve(vt) if vt else None,
+        vector_min_score=float(vec.get("min_score", 0.9)),
+        vector_fallback_name_anchor=bool(vec.get("fallback_to_name_anchor", False)),
+        vector_logo_text=bool(vec.get("write_project_name_in_logo_box", False)),
+        auto_detect_names=auto_on,
+        keep_names=tuple(str(k).strip() for k in (auto.get("keep") or []) if str(k).strip()),
     )
+    if cfg.vector_logo_enabled and cfg.vector_templates_dir is None:
+        default = cfg.output_dir / "phase1_template"  # where phase1/learn_logo.py writes them
+        cfg.vector_templates_dir = default
 
     if not cfg.input_dir.is_dir():
-        raise SystemExit(f"config: input_dir does not exist: {cfg.input_dir}")
+        raise SystemExit(f"ERROR: input folder does not exist: {cfg.input_dir}")
     if cfg.input_dir == cfg.output_dir:
         raise SystemExit("config: output_dir must differ from input_dir")
     if cfg.logo_reference_dir and not cfg.logo_reference_dir.is_dir():

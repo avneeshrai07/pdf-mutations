@@ -1,13 +1,15 @@
 # ---------------------------------------------------------------------------
 # PDF rebranding config. Edit this file, then run:   python run.py
-# Relative paths are resolved against the folder that contains this file.
+# Use full paths (relative ones are resolved against this file's folder).
 # ---------------------------------------------------------------------------
 
 paths:
-  # Folder that holds the PDFs to process.
-  input_dir: ./input
-  # Folder where the cleaned PDFs are written (created if missing).
-  output_dir: ./output
+  # Full path of the folder that holds the PDFs. Must already exist,
+  # otherwise the run stops with an error.
+  # Windows tip: use single quotes or forward slashes.
+  input_dir: 'C:\Users\Avneesh Rai\OneDrive - SG GREEN BUILDINGS PRIVATE LIMITED\Documents\pdf_trash\input'
+  # Full path where the cleaned PDFs are written. Created if missing.
+  output_dir: 'C:\Users\Avneesh Rai\OneDrive - SG GREEN BUILDINGS PRIVATE LIMITED\Documents\pdf_trash\output'
   # Look into sub-folders of input_dir too.
   recursive: true
   # true  -> output keeps the same sub-folder layout as input
@@ -17,12 +19,23 @@ paths:
 # What replaces every removed company name / logo.
 project_name: "My Project"
 
+# Extra company names to remove ON TOP of the automatic detection (see auto_detect_names).
+# Can be empty when auto_detect_names is enabled.
 # Company names to remove. Matching ignores case, spaces and punctuation
 # ("ACME Corp." matches "Acme Corp"). List every spelling/short form you need.
 companies:
   - "Acme Corporation"
   - "Acme Corp"
   - "Acme"
+
+# Find company names automatically: any name ending in a legal suffix (LTD, LIMITED, PVT LTD,
+# INC, LLC, LLP, CORP, PLC, GMBH ...) is treated as a company. Its other spellings (LTD/LIMITED),
+# its short form and its acronym (e.g. IOCL) are removed too. Run  python run.py --dry-run
+# first: it lists every name it found.
+auto_detect_names:
+  enabled: true
+  # Names that must NEVER be replaced (e.g. your own company), even if detected.
+  keep: []
 
 # Embedded image formats that may be logos. Only images whose format is in
 # this list are examined/removed; everything else (e.g. gif, tiff) is left alone.
@@ -35,6 +48,20 @@ logo_image_extensions:
 # Any embedded image that looks like one of them is removed. Leave empty to
 # rely on OCR only.
 logo_reference_dir: ""
+
+# Logos drawn as vector shapes (CAD title blocks) - there is no image file to match.
+# Learn them first with:  python phase1/learn_logo.py   (writes logo_template_N.json files)
+vector_logo:
+  enabled: true
+  # Folder with the logo_template_N.json files. Empty = <output_dir>/phase1_template
+  templates_dir: ""
+  # How much of the learned logo must be found on a page (0-1).
+  min_score: 0.9
+  # If no template matches, guess the logo from the company-name position. Off by default:
+  # it can remove real drawing lines on pages whose logo is an image instead.
+  fallback_to_name_anchor: false
+  # Also write the project name inside the emptied logo box (false = leave it blank).
+  write_project_name_in_logo_box: false
 
 options:
   # Replace company names found in the PDF text layer.
