@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# PDF rebranding config. Edit this file, then run:   python run.py
+# Relative paths are resolved against the folder that contains this file.
+# ---------------------------------------------------------------------------
+
+paths:
+  # Folder that holds the PDFs to process.
+  input_dir: ./input
+  # Folder where the cleaned PDFs are written (created if missing).
+  output_dir: ./output
+  # Look into sub-folders of input_dir too.
+  recursive: true
+  # true  -> output keeps the same sub-folder layout as input
+  # false -> every PDF is written straight into output_dir
+  preserve_structure: true
+
+# What replaces every removed company name / logo.
+project_name: "My Project"
+
+# Company names to remove. Matching ignores case, spaces and punctuation
+# ("ACME Corp." matches "Acme Corp"). List every spelling/short form you need.
+companies:
+  - "Acme Corporation"
+  - "Acme Corp"
+  - "Acme"
+
+# Embedded image formats that may be logos. Only images whose format is in
+# this list are examined/removed; everything else (e.g. gif, tiff) is left alone.
+logo_image_extensions:
+  - png
+  - jpg
+  - jpeg
+
+# Optional: folder with sample logo files (png/jpg) of the companies above.
+# Any embedded image that looks like one of them is removed. Leave empty to
+# rely on OCR only.
+logo_reference_dir: ""
+
+options:
+  # Replace company names found in the PDF text layer.
+  replace_text: true
+  # Read the text inside embedded images (OCR) and remove images that
+  # contain a company name. Needs rapidocr; slower but finds logos.
+  ocr_images: true
+  # Scanned PDFs (pages with no text layer): OCR the whole page and
+  # whiteout + overwrite company names. Slowest option.
+  ocr_scanned_pages: false
+  # Replace company names in document metadata (title, author, ...).
+  scrub_metadata: true
+
+  # How to take a logo image out:
+  #   remove -> delete the image from the page
+  #   pixels -> blank only the pixels under the logo (keeps other images)
+  image_removal: remove
+  # Ignore images bigger than this share of the page (protects backgrounds).
+  max_logo_page_fraction: 0.25
+  # Ignore images smaller than this many pixels on either side (bullets, lines).
+  min_logo_pixels: 16
+  # How close an image must be to a reference logo (0 = identical,
+  # 256 = opposite). ~25 is a good start.
+  reference_max_distance: 25
+
+  # Colour behind the replacement text. "auto" samples the page background;
+  # or give an RGB list such as [255, 255, 255].
+  fill_color: auto
+
+  # Parallel worker processes. 1 is safest; raise for large batches
+  # (each worker loads its own OCR model).
+  workers: 1
+  # Skip PDFs that already exist in output_dir (lets you resume a big run).
+  skip_existing: true
+  # Copy PDFs that contained nothing to change into output_dir as well,
+  # so output_dir ends up with the complete set.
+  copy_unchanged: true
